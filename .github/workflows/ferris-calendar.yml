@@ -3,7 +3,7 @@ name: Update Ferris calendar
 on:
   workflow_dispatch:
   schedule:
-    - cron: '17 6 * * *'
+    - cron: "17 6 * * *"
       timezone: America/Los_Angeles
 
 permissions:
@@ -18,175 +18,269 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     environment: github-pages
+
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/configure-pages@v5
 
-      - name: Install browser tools
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install browser and calendar tools
         run: |
-          python -m pip install playwright icalendar
+          python -m pip install --retries 5 playwright icalendar
           python -m playwright install --with-deps chromium
 
-      - name: Read Arbiter and build calendar
+      - name: Read Arbiter and build the Ferris calendar
         shell: python
         run: |
           import json
           import os
           import re
+          import time
           from datetime import datetime, timedelta, timezone
           from pathlib import Path
-          from urllib.error import HTTPError
-          from urllib.parse import urljoin
-          from urllib.request import urlopen
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
           from zoneinfo import ZoneInfo
 
           from icalendar import Calendar, Event
-          from playwright.sync_api import sync_playwright
+          from playwright.sync_api import Error as BrowserError, sync_playwright
 
-          source = "https://arbiterlive.com/School/Calendar/7488"
-          published = "https://kaseehildenbrand.github.io/at-event-pilot/"
-          pacific = ZoneInfo("America/Los_Angeles")
-          summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          SOURCE = "https://arbiterlive.com/School/Calendar/7488"
+          PUBLISHED = "https://kaseehildenbrand.github.io/at-event-pilot/"
+          TARGET_MONTH = datetime(2026, 12, 1)
+          PACIFIC = ZoneInfo("America/Los_Angeles")
+          SUMMARY = Path(os.environ["GITHUB_STEP_SUMMARY"])
 
-          # Read the last successfully published schedule for comparison.
-          try:
-              with urlopen(published + "schedule.json", timeout=30) as response:
-                  previous = json.load(response)
-          except HTTPError as error:
-              if error.code != 404:
-                  raise
-              previous = {}
+          GAME_DATE = re.compile(
+              r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
+              r"\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+              r"\s+(\d{1,2})(?:st|nd|rd|th)?\b",
+              re.IGNORECASE,
+          )
+          GAME_TIME = re.compile(r"(\d{1,2}:\d{2})\s*([ap])(?:m)?\b", re.IGNORECASE)
+          GAME_VENUE = re.compile(r"(?m)^\s*Location[ \t]*\n[ \t]*([^\n]+)")
 
-          games = {}
-          review = []
-          with sync_playwright() as playwright:
-              browser = playwright.chromium.launch()
-              month = browser.new_page()
-              month.goto(source, wait_until="domcontentloaded")
-              heading = month.locator("#calTitle")
-              heading.wait_for()
-              target = datetime(2026, 12, 1)
+          def read_previous_schedule():
+              for attempt in range(3):
+                  try:
+                      request = Request(
+                          PUBLISHED + "schedule.json",
+                          headers={"Cache-Control": "no-cache"},
+                      )
+                      with urlopen(request, timeout=25) as response:
+                          return json.load(response)
+                  except HTTPError as error:
+                      if error.code == 404:
+                          return {}
+                      if attempt == 2:
+                          raise RuntimeError(
+                              f"Could not read the previous schedule (HTTP {error.code})."
+                          ) from error
+                  except (URLError, TimeoutError, json.JSONDecodeError) as error:
+                      if attempt == 2:
+                          raise RuntimeError("Could not read the previous schedule.") from error
+                  time.sleep(3 * (attempt + 1))
 
+          def open_page(page, url, ready_selector):
+              for attempt in range(3):
+                  try:
+                      response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                      if response is None or not response.ok:
+                          status = response.status if response else "no response"
+                          raise RuntimeError(f"Arbiter returned {status} for {url}.")
+                      page.locator(ready_selector).first.wait_for(timeout=15000)
+                      return
+                  except (BrowserError, RuntimeError) as error:
+                      if attempt == 2:
+                          raise RuntimeError(f"Could not load {url}: {error}") from error
+                      time.sleep(3 * (attempt + 1))
+
+          def find_home_games(page):
+              open_page(page, SOURCE, "#calTitle")
+              heading = page.locator("#calTitle")
               for _ in range(25):
-                  current = datetime.strptime(heading.inner_text().strip(), "%B %Y")
-                  if current == target:
+                  month_text = heading.inner_text().strip()
+                  current_month = datetime.strptime(month_text, "%B %Y")
+                  if current_month == TARGET_MONTH:
                       break
-                  direction = "Next month" if current < target else "Previous month"
-                  month.get_by_role("button", name=direction, exact=True).click()
-                  month.wait_for_function(
+                  direction = "Next month" if current_month < TARGET_MONTH else "Previous month"
+                  page.get_by_role("button", name=direction, exact=True).click()
+                  page.wait_for_function(
                       "old => document.querySelector('#calTitle').innerText.trim() !== old",
-                      arg=current.strftime("%B %Y"),
+                      arg=month_text,
                   )
               else:
-                  raise RuntimeError("Could not reach December 2026 in Arbiter.")
+                  raise RuntimeError("Could not reach December 2026 on the Ferris calendar.")
 
-              home_links = month.locator("a.homeGameCalItem[href*='/Teams/Game/']:visible")
-              home_links.first.wait_for()
-              entries = home_links.evaluate_all(
+              links = page.locator("a.homeGameCalItem[href*='/Teams/Game/']:visible")
+              links.first.wait_for(timeout=30000)
+              return links.evaluate_all(
                   """links => links.map(link => ({
-                    url: link.href,
-                    title: link.querySelector('.fc-event-title')?.textContent.trim() || '',
-                    time: link.querySelector('.fc-event-time')?.textContent.trim() || ''
+                      url: link.href,
+                      title: link.querySelector('.fc-event-title')?.textContent.trim() || '',
+                      time: link.querySelector('.fc-event-time')?.textContent.trim() || ''
                   }))"""
               )
-              detail = browser.new_page()
-              for entry in entries:
-                  detail.goto(entry["url"], wait_until="domcontentloaded")
-                  page_text = detail.locator("main").inner_text()
-                  date_match = re.search(
-                      r"\b(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day\s+"
-                      r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
-                      r"\s+(\d{1,2})(?:st|nd|rd|th)?\b",
-                      page_text,
-                      re.IGNORECASE,
+
+          def read_game(page, entry):
+              open_page(page, entry["url"], "main")
+              page_text = page.locator("main").inner_text()
+              date = GAME_DATE.search(page_text)
+              if date is None:
+                  raise ValueError("could not verify the date")
+              if date[1].lower() != "dec":
+                  return None
+
+              times = GAME_TIME.findall(entry["time"])
+              venue = GAME_VENUE.search(page_text)
+              if len(times) != 2 or venue is None or not entry["title"]:
+                  raise ValueError("could not verify the title, start/end time, or venue")
+
+              day = int(date[2])
+              start, end = [
+                  datetime.strptime(
+                      f"2026-12-{day:02d} {clock}{period.upper()}M",
+                      "%Y-%m-%d %I:%M%p",
+                  ).replace(tzinfo=PACIFIC)
+                  for clock, period in times
+              ]
+              if end < start:
+                  end += timedelta(days=1)
+
+              return {
+                  "title": "Ferris — " + entry["title"],
+                  "start": start.astimezone(timezone.utc).isoformat(),
+                  "end": end.astimezone(timezone.utc).isoformat(),
+                  "venue": venue[1].strip(),
+                  "url": entry["url"],
+              }
+
+          def collect_games():
+              games = {}
+              review = []
+              with sync_playwright() as playwright:
+                  browser = playwright.chromium.launch()
+                  month = browser.new_page()
+                  detail = browser.new_page()
+                  month.set_default_timeout(20000)
+                  detail.set_default_timeout(15000)
+
+                  for entry in find_home_games(month):
+                      game_id = entry["url"].split("/Teams/Game/")[1].split("/")[0]
+                      try:
+                          game = read_game(detail, entry)
+                      except (ValueError, RuntimeError, BrowserError) as error:
+                          label = entry["title"] or f"Arbiter game {game_id}"
+                          reason = str(error).splitlines()[0]
+                          review.append(f"- Review [{label}]({entry['url']}) — {reason}.")
+                          continue
+                      if game is not None:
+                          games[game_id] = game
+
+                  browser.close()
+              return games, review
+
+          def local_time(value):
+              return datetime.fromisoformat(value).astimezone(PACIFIC).strftime(
+                  "%b %d, %I:%M %p"
+              )
+
+          def compare_schedules(previous, games, review):
+              report = [f"## Ferris December 2026 · {len(games)} verified home games", ""]
+              changes = []
+
+              for game_id, game in sorted(games.items(), key=lambda item: item[1]["start"]):
+                  old = previous.get(game_id)
+                  label = f"[{game['title']}]({game['url']})"
+                  if old is None:
+                      if previous:
+                          changes.append(f"- Added {label} — {local_time(game['start'])}.")
+                      continue
+
+                  details = []
+                  for field in ("start", "end"):
+                      if old.get(field) != game[field]:
+                          before = local_time(old[field]) if old.get(field) else "unknown"
+                          details.append(f"{field} {before} → {local_time(game[field])}")
+                  if old.get("venue") != game["venue"]:
+                      details.append(f"venue {old.get('venue', 'unknown')} → {game['venue']}")
+                  if old.get("title") != game["title"]:
+                      details.append(f"title was {old.get('title', 'unknown')}")
+                  if details:
+                      changes.append(f"- Changed {label} — {', '.join(details)}.")
+
+              for game_id, old in previous.items():
+                  if game_id not in games:
+                      changes.append(
+                          f"- Verify before removing [{old['title']}]({old['url']}). "
+                          "The last verified details are still in the feed."
+                      )
+                      games[game_id] = old
+
+              if not previous:
+                  report.append("First run with a saved schedule. This is the baseline.")
+              elif not changes and not review:
+                  report.append("No changes found.")
+              return report + changes + review
+
+          def write_site(games):
+              calendar = Calendar()
+              calendar.add("prodid", "-//AT Event Pilot//Ferris Schedule//EN")
+              calendar.add("version", "2.0")
+              calendar.add("calscale", "GREGORIAN")
+              timestamp = datetime.now(timezone.utc)
+
+              for game_id, game in sorted(games.items(), key=lambda item: item[1]["start"]):
+                  event = Event()
+                  event.add("uid", f"ferris-{game_id}@at-event-pilot")
+                  event.add("dtstamp", timestamp)
+                  event.add("dtstart", datetime.fromisoformat(game["start"]))
+                  event.add("dtend", datetime.fromisoformat(game["end"]))
+                  event.add("summary", game["title"])
+                  event.add("location", game["venue"])
+                  event.add("url", game["url"])
+                  calendar.add_component(event)
+
+              output = Path("site")
+              output.mkdir(exist_ok=True)
+              (output / "calendar.ics").write_bytes(calendar.to_ical())
+              (output / "schedule.json").write_text(
+                  json.dumps(games, ensure_ascii=False), encoding="utf-8"
+              )
+              (output / "index.html").write_text(
+                  '<!doctype html><title>Ferris calendar</title>'
+                  '<p><a href="calendar.ics">Ferris calendar feed</a></p>',
+                  encoding="utf-8",
+              )
+
+          try:
+              previous = read_previous_schedule()
+              games, review = collect_games()
+              if not games:
+                  details = "\n".join(review[:5])
+                  raise RuntimeError(
+                      "No December 2026 home games could be verified. "
+                      "Publishing stopped to preserve the last successful calendar.\n"
+                      + details
                   )
-                  if not date_match:
-                      raise RuntimeError(f"Could not verify the game date: {entry['url']}")
-                  if date_match[1].lower() != "dec":
-                      continue
+              report = compare_schedules(previous, games, review)
+              write_site(games)
+              SUMMARY.write_text("\n".join(report) + "\n", encoding="utf-8")
+          except Exception as error:
+              SUMMARY.write_text(
+                  f"## Ferris calendar update failed\n\n{error}\n", encoding="utf-8"
+              )
+              raise
 
-                  game_id = entry["url"].split("/Teams/Game/")[1].split("/")[0]
-                  title = "Ferris — " + entry["title"]
-                  times = re.findall(r"(\d{1,2}:\d{2})\s*([ap])(?:m)?\b",
-                                     entry["time"], re.IGNORECASE)
-                  venue_match = re.search(r"(?m)^Location\s*\n\s*([^\n]+)", page_text)
-                  if len(times) != 2 or not venue_match or not entry["title"]:
-                      review.append(f"[{title}]({entry['url']}) — verify time or venue")
-                      continue
-
-                  day = int(date_match[2])
-                  start, end = [
-                      datetime.strptime(
-                          f"2026-12-{day:02d} {clock}{period.upper()}M",
-                          "%Y-%m-%d %I:%M%p",
-                      ).replace(tzinfo=pacific)
-                      for clock, period in times
-                  ]
-                  if end < start:
-                      end += timedelta(days=1)
-
-                  games[game_id] = {
-                      "title": title,
-                      "start": start.astimezone(timezone.utc).isoformat(),
-                      "end": end.astimezone(timezone.utc).isoformat(),
-                      "venue": venue_match[1].strip(),
-                      "url": entry["url"],
-                  }
-              browser.close()
-
-          if not games:
-              raise RuntimeError("No verified December home games. Check the Arbiter page.")
-
-          report = [f"## Ferris December 2026 · {len(games)} verified home games", ""]
-          if not previous:
-              report.append("First run. This schedule will be the baseline.")
-          for game_id, game in games.items():
-              old = previous.get(game_id)
-              label = f"[{game['title']}]({game['url']})"
-              if previous and old is None:
-                  report.append(f"- Added: {label}")
-              elif old is not None and old != game:
-                  fields = ", ".join(key for key in ("title", "start", "end", "venue")
-                                     if old.get(key) != game[key])
-                  report.append(f"- Changed ({fields or 'source link'}): {label}")
-
-          for game_id, old in previous.items():
-              if game_id not in games:
-                  report.append(f"- Verify before removing: [{old['title']}]({old['url']})")
-                  games[game_id] = old
-
-          report.extend(f"- Needs review: {item}" for item in review)
-          if len(report) == 2:
-              report.append("No changes found.")
-          summary_path.write_text("\n".join(report) + "\n", encoding="utf-8")
-
-          calendar = Calendar()
-          calendar.add("prodid", "-//AT Event Pilot//Ferris Schedule//EN")
-          calendar.add("version", "2.0")
-          for game_id, game in sorted(games.items(), key=lambda item: item[1]["start"]):
-              event = Event()
-              event.add("uid", f"ferris-{game_id}@at-event-pilot")
-              event.add("dtstamp", datetime.now(timezone.utc))
-              event.add("dtstart", datetime.fromisoformat(game["start"]))
-              event.add("dtend", datetime.fromisoformat(game["end"]))
-              event.add("summary", game["title"])
-              event.add("location", game["venue"])
-              event.add("url", game["url"])
-              calendar.add_component(event)
-
-          output = Path("site")
-          output.mkdir()
-          (output / "calendar.ics").write_bytes(calendar.to_ical())
-          (output / "schedule.json").write_text(json.dumps(games), encoding="utf-8")
-          (output / "index.html").write_text(
-              '<!doctype html><title>Ferris calendar</title>'
-              '<p><a href="calendar.ics">Ferris calendar feed</a></p>',
-              encoding="utf-8",
-          )
-
-      - uses: actions/upload-pages-artifact@v4
+      - name: Upload calendar for GitHub Pages
+        uses: actions/upload-pages-artifact@v4
         with:
           path: site
 
-      - uses: actions/deploy-pages@v4
+      - name: Publish calendar
+        uses: actions/deploy-pages@v4
